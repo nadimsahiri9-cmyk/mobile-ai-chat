@@ -12,7 +12,8 @@ from urllib.parse import urlparse
 from collections import deque
 
 HOST = "0.0.0.0"
-PORT = 8081
+PORT = 8080
+STATIC_DIR = "/home/node/.openclaw/workspace"
 DB_PATH = "/home/node/.n8n/database.sqlite"
 
 # Stockage historique (max 60 points = ~15 min à 15s intervalle)
@@ -38,8 +39,11 @@ class APIHandler(BaseHTTPRequestHandler):
             "/api/n8n/workflows": self.handle_n8n_workflows,
             "/api/stats/history": self.handle_stats_history,
         }
-        handler = routes.get(path, self.handle_404)
-        handler()
+        handler = routes.get(path, None)
+        if handler:
+            handler()
+        else:
+            self.handle_static()
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -107,11 +111,31 @@ class APIHandler(BaseHTTPRequestHandler):
                         stats["disk_pct"] = parts[4]
 
             # Docker info (running containers)
-            out = subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True, timeout=5)
-            if out.returncode == 0:
-                stats["containers"] = len(out.stdout.strip().split("\n")) if out.stdout.strip() else 0
-            else:
-                stats["containers"] = "N/A"
+            try:
+                out = subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True, timeout=5)
+                if out.returncode == 0:
+                    stats["containers"] = len(out.stdout.strip().split("\n")) if out.stdout.strip() else 0
+                else:
+                    stats["containers"] = "N/A"
+            except: pass
+
+            # Network traffic
+            out = subprocess.run(["cat", "/proc/net/dev"], capture_output=True, text=True, timeout=3)
+            for line in out.stdout.split("\n"):
+                if "eth0:" in line:
+                    parts = line.split()
+                    stats["net_rx"] = round(int(parts[1]) / 1024 / 1024, 1)  # MB
+                    stats["net_tx"] = round(int(parts[9]) / 1024 / 1024, 1)
+                    break
+
+            # Top processes (3 plus lourds CPU)
+            out = subprocess.run(["ps", "ax", "--sort=-%cpu", "-o", "%cpu=,%mem=,args=", "--no-headers"], capture_output=True, text=True, timeout=3)
+            top = []
+            for line in out.stdout.split("\n")[:3]:
+                p = line.strip().split(None, 2)
+                if len(p) >= 3:
+                    top.append({"cpu": p[0], "mem": p[1], "proc": p[2][:30]})
+            stats["top_procs"] = top
 
         except Exception as e:
             stats["error"] = str(e)
@@ -127,7 +151,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.json_response({"data": stats, "timestamp": time.time()})
 
     def handle_services(self):
-        """Statut des services: OpenClaw, n8n, Caddy"""
+        """Statut des services: OpenClaw, n8n"""
         services = {}
 
         # OpenClaw check
@@ -147,13 +171,7 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             services["n8n"] = {"status": "error", "error": str(e)}
 
-        # Caddy check (container)
-        try:
-            req = urllib.request.Request("http://localhost:8080/")
-            resp = urllib.request.urlopen(req, timeout=3)
-            services["caddy_container"] = {"status": "ok", "code": resp.status}
-        except Exception as e:
-            services["caddy_container"] = {"status": "error", "error": str(e)}
+        # Caddy removed - API now serves on 8080
 
         self.json_response({"data": services, "timestamp": time.time()})
 
@@ -275,6 +293,38 @@ class APIHandler(BaseHTTPRequestHandler):
             self.json_response({"status": "triggered", "webhook": wf_name, "code": resp.status})
         except Exception as e:
             self.json_response({"status": "error", "error": str(e)}, 500)
+
+    def handle_static(self):
+        """Sert les fichiers statiques du workspace (remplace Caddy)"""
+        path = urlparse(self.path).path
+        if path == "/" or path == "":
+            path = "/index.html"
+        # Map /habib-landing/ or /app/habib-landing/ to the directory
+        rel = path.replace("/app/habib-landing", "").replace("/habib-landing", "")
+        if rel == "" or rel == "/":
+            rel = "/habib-landing/index.html"
+        filepath = STATIC_DIR + rel
+        if os.path.isfile(filepath):
+            try:
+                with open(filepath, "rb") as f:
+                    data = f.read()
+                ext = os.path.splitext(filepath)[1]
+                mime = {".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "application/javascript", ".json": "application/json", ".png": "image/png", ".jpg": "image/jpeg", ".svg": "image/svg+xml", ".ico": "image/x-icon"}
+                self.send_response(200)
+                self.send_header("Content-Type", mime.get(ext, "application/octet-stream"))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(data)
+            except:
+                self.send_response(500)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "file not found"}).encode())
 
     def handle_404(self):
         self.json_response({"error": "not found", "paths": ["/api/stats", "/api/services", "/api/ping", "POST /api/webhook/gumroad"]}, 404)
