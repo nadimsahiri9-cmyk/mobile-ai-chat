@@ -1,0 +1,10 @@
+:8080 {
+    # API backend (statistiques, services)
+    handle /api/* {
+        reverse_proxy localhost:8081
+    }
+
+    # Fichiers statiques du workspace
+    root * /home/node/.openclaw/workspace
+    file_server browse
+}
